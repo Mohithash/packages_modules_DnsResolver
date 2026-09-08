@@ -118,6 +118,9 @@
 #include "stats.h"
 #include "stats.pb.h"
 #include "util.h"
+// NULLROUTE-BEGIN
+#include "nullroute/nr_wire.h"
+// NULLROUTE-END
 
 using namespace std::chrono_literals;
 // TODO: use the namespace something like android::netd_resolv for libnetd_resolv
@@ -1550,6 +1553,34 @@ int res_tls_send(const std::list<DnsTlsServer>& tlsServers, ResState* statp, con
 int resolv_res_nsend(const android_net_context* netContext, std::optional<int> app_socket,
                      span<const uint8_t> msg, span<uint8_t> ans, int* rcode, uint32_t flags,
                      NetworkDnsEventReported* event) {
+// NULLROUTE-BEGIN
+#ifdef NULLROUTE_ENABLED
+    // H3. This is the EXTERNAL entry point: its only caller is DnsProxyListener's
+    // ResNSendCommand handler, i.e. android.net.DnsResolver.rawQuery(). The
+    // res_nsend() below is the INTERNAL one that res_nsearch()/res_nquery() — and
+    // therefore every getaddrinfo() lookup — also reaches, so hooking that instead
+    // would re-evaluate ~99% of the device's traffic several frames after H1 has
+    // already decided it, double-count every block, and reach a second verdict on
+    // a question H1 had acted on.
+    //
+    // Guarded for the same reason as H1 and H2: this hunk runs before the
+    // function's own argument validation, and a null deref inside netd restarts
+    // zygote.
+    if (netContext != nullptr && rcode != nullptr) {
+        // A positive return is a complete synthesized wire answer already in the
+        // caller's buffer, with *rcode set to match — exactly the contract of the
+        // real call below. Zero means "not ours", and zero is also what every
+        // internal failure returns, so no raw query can fail because of Nullroute.
+        //
+        // `event` is deliberately left untouched: an intercepted query never
+        // reached a transport, and filling in server statistics for a lookup that
+        // did not happen would put fiction into the metrics. H1 does the same.
+        const int nr_len = nr::resNSend(msg.data(), msg.size(), netContext->uid,
+                                        ans.data(), ans.size(), rcode);
+        if (nr_len > 0) return nr_len;
+    }
+#endif
+// NULLROUTE-END
     assert(event != nullptr);
     ResState res(netContext, app_socket, event);
     resolv_populate_res_for_net(&res);

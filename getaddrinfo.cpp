@@ -65,6 +65,12 @@
 #include "res_debug.h"
 #include "resolv_cache.h"
 #include "resolv_private.h"
+// NULLROUTE-BEGIN
+#include "nullroute/nr_hook.h"
+// NULLROUTE-END
+// NULLROUTE-BEGIN
+#include "nullroute/NrCname.h"
+// NULLROUTE-END
 
 #define ANY 0
 
@@ -426,6 +432,52 @@ int resolv_getaddrinfo(const char* _Nonnull hostname, const char* servname, cons
                        const android_net_context* _Nonnull netcontext,
                        std::optional<int> app_socket, addrinfo** _Nonnull res,
                        NetworkDnsEventReported* _Nonnull event) {
+// NULLROUTE-BEGIN
+#ifdef NULLROUTE_ENABLED
+    // The null guard is NOT redundant with this function's own argument
+    // validation. That validation sits a few lines BELOW; this hunk runs first,
+    // by design, so that a block short-circuits everything downstream of it.
+    // Dereferencing a null netcontext here would be a SIGSEGV inside netd, whose
+    // init stanza carries `onrestart restart zygote` — a boot loop, not a failed
+    // lookup. One perfectly-predicted branch is the whole cost of never finding
+    // that out on a user's device.
+    if (netcontext != nullptr && res != nullptr) {
+        // netcontext->uid is the real caller uid — netd reads it from SO_PEERCRED
+        // on the dnsproxyd socket — which is what makes per-app policy correct at
+        // this layer and only approximate in any VpnService design.
+        const nr::Verdict nrv = nr::hook(hostname, netcontext->uid);
+        if (nrv.kind == nr::V_BLOCK) return nr::blockErrno();
+        if (nrv.kind == nr::V_REDIRECT) {
+            char nraddr[INET6_ADDRSTRLEN];
+            if (nr::formatAddr(nrv, nraddr, sizeof(nraddr))) {
+                // A fresh addrinfo rather than a copy of the caller's hints:
+                // inheriting AI_CANONNAME would make the resolver try to fill a
+                // canonical name for a synthetic answer.
+                addrinfo nrpai = {};
+                nrpai.ai_family = hints ? hints->ai_family : AF_UNSPEC;
+                nrpai.ai_socktype = hints ? hints->ai_socktype : 0;
+                nrpai.ai_protocol = hints ? hints->ai_protocol : 0;
+                // RE-ENTRANCY, deliberate and bounded to exactly one extra level:
+                // getaddrinfo_numeric() is a thin wrapper that calls back into
+                // this very function with AI_NUMERICHOST. Termination rests on
+                // nraddr always being a numeric literal (it comes from
+                // inet_ntop) and on nr_canonicalize() refusing IP literals, so
+                // the inner call returns V_PASS before it can redirect again.
+                // If you ever make the matcher able to match an IP literal, this
+                // becomes unbounded recursion inside netd — read nr_is_ip_literal()
+                // before touching it.
+                return getaddrinfo_numeric(nraddr, servname, nrpai, res);
+            }
+            // The address could not be rendered. Falling through would resolve,
+            // for real, a name the policy already decided to intercept — a
+            // SILENT filtering failure, which is the only outcome worse than a
+            // loud one. Fail-open covers Nullroute being broken, not Nullroute
+            // having already reached a verdict; degrade to the block.
+            return nr::blockErrno();
+        }
+    }
+#endif
+// NULLROUTE-END
     if (hostname == nullptr && servname == nullptr) return EAI_NONAME;
     if (hostname == nullptr) return EAI_NODATA;
 
@@ -1445,6 +1497,43 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
     addrinfo sentinel = {};
     addrinfo* cur = &sentinel;
     for (const auto& query : queries) {
+// NULLROUTE-BEGIN
+#ifdef NULLROUTE_ENABLED
+        // H5. The answer hook. H1 has already cleared the QUESTION, so anything
+        // caught here is a name that only became visible in the REPLY: a
+        // CNAME-cloaked tracker, served under a first-party subdomain no
+        // blocklist can carry. nullroute/NrCname.h explains the shape.
+        //
+        // Guarded like every other hook site: this runs inside netd, whose init
+        // stanza carries `onrestart restart zygote`, so a null deref is a boot
+        // loop rather than a failed lookup.
+        //
+        // OFF unless NrControl::cname_uncloak is set — the default device pays
+        // one relaxed byte load per answer for this line and nothing else.
+        //
+        // Dropping is a `continue`, not a return: the sibling A/AAAA query in
+        // this loop is a separate answer and gets judged on its own bytes.
+        // Setting `he` makes a dropped answer indistinguishable from one that
+        // legitimately carried nothing, which is what the code below already
+        // knows how to report.
+        //
+        // The length is clamped to the buffer's own size and not merely to zero.
+        // `query.n` is a received byte count, and the ONE thing the parser
+        // cannot defend itself against is being handed a length longer than the
+        // allocation it was pointed at. Asserting that here costs a compare and
+        // removes the question entirely.
+        if (netcontext != nullptr &&
+            nr::cnameBlocked(query.answer.data(),
+                             (query.n > 0 &&
+                              (size_t)query.n <= query.answer.size())
+                                     ? (size_t)query.n
+                                     : (size_t)0,
+                             netcontext->uid)) {
+            he = HOST_NOT_FOUND;
+            continue;
+        }
+#endif
+// NULLROUTE-END
         addrinfo* ai = getanswer(query.answer, query.n, query.name, query.qtype, pai, &he);
         if (ai) {
             cur->ai_next = ai;
@@ -1551,6 +1640,14 @@ static struct addrinfo* getCustomHosts(const size_t netid, const char* _Nonnull 
 
 static bool files_getaddrinfo(const size_t netid, const char* name, const addrinfo* pai,
                               addrinfo** res) {
+// NULLROUTE-BEGIN
+#ifdef NULLROUTE_ENABLED
+    // L1 is authoritative, so skip the linear rescan of /system/etc/hosts that
+    // this function performs — fopen, fgets, strcasecmp per token — on EVERY
+    // cache-missing query.
+    if (nr::hostsLayerSuperseded(name)) return false;
+#endif
+// NULLROUTE-END
     struct addrinfo sentinel = {};
     struct addrinfo *p, *cur;
     FILE* hostf = nullptr;

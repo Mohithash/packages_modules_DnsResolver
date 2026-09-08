@@ -260,6 +260,9 @@ cc_library {
         "netd_defaults",
     ],
     srcs: [
+        // NULLROUTE-BEGIN
+        "nullroute/NrFilter.cpp", "nullroute/NrRingWriter.cpp", "nullroute/NrResSend.cpp", "nullroute/NrCname.cpp",
+        // NULLROUTE-END
         "addrlabel.cpp",
         "getaddrinfo.cpp",
         "gethnamaddr.cpp",
@@ -324,6 +327,9 @@ cc_library {
         "libstatssocket",
     ],
     header_libs: [
+        // NULLROUTE-BEGIN
+        "libnrformat_headers",
+        // NULLROUTE-END
         "bpf_headers",
         "libnetdbinder_utils_headers",
     ],
@@ -345,6 +351,12 @@ cc_library {
     },
     apex_available: ["com.android.tethering"],
     min_sdk_version: "apex_inherit",
+    // NULLROUTE-BEGIN
+    whole_static_libs: ["libnrfilter"],
+    // NULLROUTE-END
+    // NULLROUTE-BEGIN
+    cflags: ["-DNULLROUTE_ENABLED"],
+    // NULLROUTE-END
 }
 
 cc_library_static {

@@ -82,6 +82,9 @@
 #include "resolv_cache.h"
 #include "resolv_private.h"
 #include "stats.pb.h"
+// NULLROUTE-BEGIN
+#include "nullroute/nr_hook.h"
+// NULLROUTE-END
 
 using android::net::NetworkDnsEventReported;
 
@@ -373,6 +376,32 @@ nospc:
 int resolv_gethostbyname(const char* name, int af, hostent* hp, char* buf, size_t buflen,
                          const android_net_context* netcontext, std::optional<int> app_socket,
                          hostent** result, NetworkDnsEventReported* event) {
+// NULLROUTE-BEGIN
+#ifdef NULLROUTE_ENABLED
+    // Guarded for the same reason as H1: this hunk runs before the function's own
+    // argument validation, and both pointers are dereferenced below. A null deref
+    // in netd restarts zygote.
+    if (netcontext != nullptr && result != nullptr) {
+        const nr::Verdict nrv = nr::hook(name, netcontext->uid);
+        if (nrv.kind == nr::V_BLOCK) {
+            *result = nullptr;
+            return nr::blockErrno();
+        }
+        if (nrv.kind == nr::V_REDIRECT) {
+            // getent(1) and every legacy gethostbyname() caller arrives here and
+            // not through getaddrinfo, so the idx-probe liveness check has to
+            // work on this path too.
+            if (nr::fillHostent(nrv, name, af, hp, buf, buflen, result) == 0) return 0;
+            // Wrong address family for this caller, or a scratch buffer too small
+            // to hold the answer. Continuing to the normal lookup would resolve a
+            // name the policy already intercepted, so degrade to the block rather
+            // than leak past a verdict we have already reached.
+            *result = nullptr;
+            return nr::blockErrno();
+        }
+    }
+#endif
+// NULLROUTE-END
     if (name == nullptr || hp == nullptr) {
         return EAI_SYSTEM;
     }
