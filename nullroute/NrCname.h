@@ -146,6 +146,16 @@ struct NrCnameChain {
  * which is another reason to decline rather than to guess.
  */
 static inline NrCnameStatus nr_cname_walk(const uint8_t* buf, size_t len, NrCnameChain* out) {
+    if (!buf || !out) return NR_CNAME_MALFORMED;
+    /* Own the initialisation rather than inheriting it from the wrapper. This is
+     * a separately-callable entry point that both WRITES `out->count` and INDEXES
+     * `out->link[out->count]` with it; a caller that reached it with a stack-junk
+     * chain would write past the array before any bound in this function ran.
+     * Two stores on a path that then walks a packet is not a cost worth trading
+     * for that. */
+    out->count     = 0;
+    out->truncated = false;
+
     if (len < NR_WIRE_HEADER) return NR_CNAME_SHORT;
     if (len > NR_WIRE_MAX_MSG) return NR_CNAME_MALFORMED;
 

@@ -153,6 +153,11 @@ void nr_ring_write(NrControl* ctl, uid_t uid, const Verdict& v, const char* name
     const uint8_t lvl = ctl ? __atomic_load_n(&ctl->log_level, __ATOMIC_RELAXED) : 0;
     if (lvl == 0) return;
     if (lvl < 2 && v.kind == V_PASS) return;
+    /* `name` is indexed by the truncation walk below and memcpy'd from. It is
+     * non-null on every call site today, but this is a non-static entry point
+     * declared in a header, and the cost of the guard is a branch that never
+     * mispredicts. */
+    if (name == nullptr) return;
 
     NrRingHeader* hdr = ring_map(ctl);
     if (!hdr) return;   /* ring_map already counted the drop */

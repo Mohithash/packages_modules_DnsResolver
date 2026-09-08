@@ -186,6 +186,29 @@ NrControl* NrFilter::controlPage() {
 
 void NrFilter::slowPath(NrControl* ctl, uint64_t want, uint32_t epoch) {
     if (state_.load(std::memory_order_relaxed) == ST_DISABLED) return;
+
+    /*
+     * Backoff BEFORE the try-lock, not after it.
+     *
+     * While no index is mapped — the state every device is in until the user
+     * picks a list, and the state a device with a rejected index stays in for
+     * the whole boot — evaluate() reaches here on EVERY query. Taking the lock
+     * first meant one contended read-modify-write on a single global cache line
+     * per DNS lookup across every netd handler thread, purely to discover the
+     * retry deadline had not expired. The deadline is the same one tested below
+     * once the lock is held; this is that test, moved ahead of the cost.
+     *
+     * This is a FILTER only. The snapshot it reads can go stale between here and
+     * the lock, so nothing is decided on it — everything below re-reads under the
+     * lock, which is what stops two threads from each deciding to remap.
+     *
+     * An epoch change is never gated by the backoff: a mode toggle from the QS
+     * tile must republish the health property now, not after a minute.
+     */
+    if (epoch == seen_epoch_.load(std::memory_order_relaxed) &&
+        nr_mono_ms() < retry_at_ms_.load(std::memory_order_relaxed))
+        return;
+
     /* Try-lock, never block: a DNS query must not wait on another query's mmap.
      * A thread that loses simply serves from the mapping already published, one
      * generation stale for a few microseconds. */
@@ -462,7 +485,11 @@ static inline bool nr_is_probe_name(const char* name) {
  */
 static inline bool nr_has_two_labels(const char* name) {
     size_t n = strnlen(name, NR_MAX_NAME + 1);
-    if (n && name[n - 1] == '.') --n;          /* "localhost." is still one label */
+    /* Strip EVERY trailing dot, not just one: "localhost.." must count as one
+     * label for the same reason "localhost." does, and nr_canonicalize() strips
+     * them all — a disagreement here is H4 superseding the hosts scan for a name
+     * L1 then refuses to speak for. */
+    while (n && name[n - 1] == '.') --n;
     for (size_t i = 0; i < n; ++i)
         if (name[i] == '.') return true;
     return false;
@@ -477,6 +504,12 @@ bool NrFilter::hostsLayerSuperseded(const char* name) {
      * allowed to be wrong. */
     if (!name) return false;
     if (!nr_has_two_labels(name)) return false;
+    /* The other half of "a name L1 could actually speak for", which the two-label
+     * test alone does not cover: nr_canonicalize() refuses .local/.onion/.arpa/
+     * .localhost outright, so evaluate() ALWAYS passes them and L1 is never
+     * authoritative for one. Superseding the hosts scan for a name we have
+     * already decided not to judge is the definition of a wrong H4. */
+    if (nr_has_skip_suffix(name, strnlen(name, NR_MAX_NAME + 1))) return false;
     /* hosts-probe.nullroute.invalid is a literal line in /system/etc/hosts and
      * is the only proof that the L0 layer survived the build. Skipping the hosts
      * scan for it would fail probe B on a healthy device. */
